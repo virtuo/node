@@ -1,0 +1,212 @@
+#!/usr/bin/env node
+
+var tcp = require("/tcp.js");
+var sys = require("/sys.js");
+
+var connection = tcp.createConnection(5858);
+connection.setEncoding("ascii");
+
+sys.print("connecting...");
+
+
+function displayPrompt () {
+  sys.print("\ndebug> ");
+}
+
+var seq = 0;
+var currentPromise = null;
+function request (command, args) {
+  var promise = new node.Promise();
+  promise.seq = ++seq;
+  currentPromise = promise;
+
+  var req = { type: "request", seq: promise.seq, command: command };
+  if (args) {
+    req["arguments"] = args;
+  }
+  var s = JSON.stringify(req);
+  var packet = "Content-Length: " + s.length + "\r\n\r\n" + s;
+  //sys.puts("SEND: " + s);
+  connection.send(packet, "ascii");
+
+  return promise;
+}
+
+function readline (line) {
+  if (currentPromise) return;
+
+  var args = line.split(/\s+/);
+  var cmd = args.shift();
+
+  switch (cmd) {
+    case '?':
+    case 'help':
+      sys.puts("Commands: scripts, eval, break, continue, quit\n");
+      displayPrompt();
+      break;
+
+    case 'c':
+    case 'continue':
+      request("continue");
+      break;
+
+    case 'eval':
+    case 'evaluate':
+      request("evaluate", { expression: args.join(" ") });
+      break;
+
+    case 'b':
+    case 'break':
+      var script;
+      var line;
+      if (args[1] && args[1].length > 0) {
+        script = args[0];
+        line = args[1];
+      } else {
+        var pair = args[0].split(':');
+        script = pair[0];
+        line = pair[1];
+      }
+      request("setbreakpoint", { type: "script", target: script, line: line });
+      break;
+
+    case 'scripts':
+      request("scripts");
+      break;
+
+    case 'exit':
+    case 'quit':
+      connection.close();
+      break;
+
+    default:
+      displayPrompt();
+      break;
+  }
+}
+
+function recvEvent (msg) {
+  switch (msg.event) {
+    case "afterCompile":
+      break;
+
+    case "scriptCollected":
+      sys.puts("script collected: " + JSON.stringify(msg));
+      break;
+
+    default:
+      sys.puts("UNKNOWN_EVENT: " + JSON.stringify(msg));
+      break;
+  }
+}
+
+function recvResponse (msg) {
+  node.assert(currentPromise);
+
+  var promise = currentPromise;
+  currentPromise = null;
+
+  if (msg.success) {
+    promise.emitSuccess(msg);
+  } else {
+    promise.emitError(msg);
+  }
+
+  switch (msg.command) {
+    case "scripts":
+      for (var i = 0; i < msg.body.length; i++) {
+        var script = msg.body[i];
+        sys.puts(script.name);
+      }
+      break;
+
+    default:
+      sys.puts("\nRESPONSE: " + JSON.stringify(msg));
+      break;
+  }
+
+  displayPrompt();
+}
+
+connection.addListener("connect", function () {
+  node.stdio.open("utf8");
+  node.stdio.addListener("data", readline);
+  sys.print("ok");
+  displayPrompt();
+});
+
+
+var buffer = "";
+var current = null; // current message being parsed.
+
+function Message () {
+  this.headersComplete = false;
+  this.headers = null;
+  this.contentLength = 0;
+}
+
+function parseBody () {
+  if (buffer.length >= current.contentLength) {
+    current.body = buffer.slice(0, current.contentLength);
+    buffer = buffer.slice(current.contentLength);
+
+    //sys.puts("body: " + JSON.stringify(current.body));
+    //sys.puts("\n" + current.headers);
+
+    if (current.body.length > 0) {
+      var msg = JSON.parse(current.body);
+      if (msg.seq && msg.seq > seq) seq = msg.seq + 1;
+      if (msg.type == "response") {
+        recvResponse(msg);
+      } else {
+        recvEvent(msg);
+      }
+    }
+    current = null;
+
+    parse();
+  }
+}
+
+function parse () {
+  if (current && current.headersComplete) {
+    parseBody();
+    return;
+  }
+
+  if (!current) current = new Message();
+  
+  var offset = buffer.indexOf("\r\n\r\n"); 
+
+  if (offset > 0) {
+    current.headersComplete = true;
+    current.headers = buffer.substr(0, offset+4);
+
+    var m = /Content-Length: (\d+)/.exec(current.headers);
+    if (m[1]) {
+      current.contentLength = parseInt(m[1], 10);
+      //sys.puts("Content length: " + this.contentLength);
+    } else {
+      sys.puts("Error: no content length");
+      current.contentLength = 0;
+    }
+   
+    buffer = buffer.slice(offset+4);
+    parse();
+  }
+}
+
+connection.addListener("receive", function (data) {
+  //sys.puts("data: " + JSON.stringify(data));
+  buffer += data;
+  parse();
+});
+
+connection.addListener("eof", function () {
+  connection.close();
+});
+
+connection.addListener("close", function () {
+  sys.puts("\nconnection closed");
+  process.exit();
+});
